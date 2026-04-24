@@ -50,6 +50,17 @@ class GoogleSttStream implements SttStream {
   /** Set on first audio write (not constructor) to avoid gRPC handshake latency drift. */
   private streamOpenedAt: Date | null = null;
   private lastResultEndMs = 0;
+  /**
+   * In-memory cache of the most recent interim (non-final) event we've seen per
+   * (resultEndTime anchor, resultIndex) key. On stream error/end, these are flushed
+   * downstream before the stream is marked closed, so VadGate's consumer (which
+   * persists to transcript_segments) can salvage partial results even if the
+   * stream 408s out before the server ever emits a final.
+   *
+   * The key is stable across interims for the same recognizer hypothesis, so
+   * later (more refined) interims naturally overwrite earlier partial text.
+   */
+  private pendingInterims = new Map<string, TranscriptEvent>();
   onClose?: () => void;
 
   constructor(
@@ -80,7 +91,8 @@ class GoogleSttStream implements SttStream {
     this.recognizeStream.on('data', (response: IStreamingRecognizeResponse) => {
       if (!response.results || response.results.length === 0) return;
 
-      for (const result of response.results) {
+      for (let resultIdx = 0; resultIdx < response.results.length; resultIdx++) {
+        const result = response.results[resultIdx];
         if (!result.alternatives || result.alternatives.length === 0) continue;
 
         const alt = result.alternatives[0];
@@ -104,6 +116,10 @@ class GoogleSttStream implements SttStream {
           segmentEnd = isFinal ? segmentStart : null;
         }
 
+        const sttResultId = result.resultEndTime
+          ? `${result.resultEndTime.seconds ?? 0}_${result.resultEndTime.nanos ?? 0}`
+          : null;
+
         const event: TranscriptEvent = {
           userId: this.userId,
           displayName: null,
@@ -113,13 +129,22 @@ class GoogleSttStream implements SttStream {
           transcript: alt.transcript ?? '',
           confidence: typeof alt.confidence === 'number' ? alt.confidence : null,
           isFinal,
-          sttResultId: result.resultEndTime
-            ? `${result.resultEndTime.seconds ?? 0}_${result.resultEndTime.nanos ?? 0}`
-            : null,
+          sttResultId,
           streamSequence: this.streamSequence,
           sttEngine: 'google-cloud-stt',
           sttModel: config.googleCloud.model,
         };
+
+        // Track the latest interim per recognizer hypothesis so we can flush
+        // if the stream dies before the server sends a final.
+        // Key includes resultIdx because multiple simultaneous hypotheses can
+        // be returned in the same response.
+        const interimKey = `${sttResultId ?? 'none'}_${resultIdx}`;
+        if (isFinal) {
+          this.pendingInterims.delete(interimKey);
+        } else {
+          this.pendingInterims.set(interimKey, event);
+        }
 
         this.onTranscript(event);
       }
@@ -132,14 +157,44 @@ class GoogleSttStream implements SttStream {
       } else {
         logger.error(`Google STT stream error for user ${userId}:`, err);
       }
+      this.flushPendingInterims('stream error');
       this._open = false;
       this.onClose?.();
     });
 
     this.recognizeStream.on('end', () => {
+      this.flushPendingInterims('stream end');
       this._open = false;
       this.onClose?.();
     });
+  }
+
+  /**
+   * Re-emit any held interim results as non-final TranscriptEvents before the
+   * stream closes. The downstream TranscriptWriter UPSERTs on the same
+   * (session_id, track_id, user_id, stream_sequence, stt_result_id) key that
+   * the original emission used — so this is idempotent with any interim that
+   * was already persisted, and guarantees noisy partials survive a 408 or EOS
+   * that would otherwise discard them.
+   *
+   * Runs inside a try/catch because the downstream handler can throw and we
+   * must not prevent stream closure (which would leak gRPC resources).
+   */
+  private flushPendingInterims(reason: string): void {
+    if (this.pendingInterims.size === 0) return;
+    const count = this.pendingInterims.size;
+    logger.warn(
+      `Google STT stream for user ${this.userId} (seq ${this.streamSequence}): ` +
+      `flushing ${count} held interim result(s) on ${reason} to preserve partial transcripts`
+    );
+    for (const event of this.pendingInterims.values()) {
+      try {
+        this.onTranscript(event);
+      } catch (err) {
+        logger.warn(`Google STT stream for user ${this.userId}: error flushing interim:`, err);
+      }
+    }
+    this.pendingInterims.clear();
   }
 
   write(pcm: Buffer): void {
@@ -160,6 +215,7 @@ class GoogleSttStream implements SttStream {
   close(): void {
     if (!this._open) return;
     this._open = false;
+    // Graceful close — any pending interims will be flushed in the 'end' handler.
     try {
       this.recognizeStream?.end();
     } catch {
