@@ -114,6 +114,9 @@ def main():
                     "--bursts is omitted, to anchor timestamps to wall-clock.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--prompt-file")
+    ap.add_argument("--speaker", help="Known speaker label for a single-speaker track "
+                    "(e.g. one per-user Discord track). When set, diarization is skipped "
+                    "and every segment is attributed to this label.")
     ap.add_argument("--language", default="en")
     ap.add_argument("--min-speakers", type=int, default=2)
     ap.add_argument("--max-speakers", type=int, default=6)
@@ -121,8 +124,9 @@ def main():
     args = ap.parse_args()
 
     hf = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not hf:
-        raise SystemExit("HF_TOKEN not set — pyannote diarization is license-gated.")
+    if not args.speaker and not hf:
+        raise SystemExit("HF_TOKEN not set — pyannote diarization is license-gated. "
+                         "(Or pass --speaker for a single-speaker track.)")
 
     prompt = None
     if args.prompt_file:
@@ -169,12 +173,18 @@ def main():
             json.dump(result, f, ensure_ascii=False)
         print(f"      cached -> {aligned_cache}", flush=True)
 
-    print(f"[3/4] diarizing ({args.min_speakers}-{args.max_speakers} speakers)...", flush=True)
-    from whisperx.diarize import DiarizationPipeline
-    diar = DiarizationPipeline(model_name="pyannote/speaker-diarization-community-1",
-                               token=hf, device=device)
-    diar_segments = diar(audio, min_speakers=args.min_speakers, max_speakers=args.max_speakers)
-    result = whisperx.assign_word_speakers(diar_segments, result)
+    if args.speaker:
+        print(f"[3/4] single-speaker track — labelling all segments '{args.speaker}' "
+              f"(diarization skipped)", flush=True)
+        for seg in result["segments"]:
+            seg["speaker"] = args.speaker
+    else:
+        print(f"[3/4] diarizing ({args.min_speakers}-{args.max_speakers} speakers)...", flush=True)
+        from whisperx.diarize import DiarizationPipeline
+        diar = DiarizationPipeline(model_name="pyannote/speaker-diarization-community-1",
+                                   token=hf, device=device)
+        diar_segments = diar(audio, min_speakers=args.min_speakers, max_speakers=args.max_speakers)
+        result = whisperx.assign_word_speakers(diar_segments, result)
 
     print("[4/4] remapping to wall-clock + writing...", flush=True)
     for seg in result["segments"]:
