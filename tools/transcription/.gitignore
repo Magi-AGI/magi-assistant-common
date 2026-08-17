@@ -3,3 +3,6 @@ __pycache__/
 
 # Local Python venv + scratch working dir (vendored deps — never commit)
 _work/
+
+# Session-specific transcription prompts are local-only; do not commit prompt text
+prompts/*.txt
